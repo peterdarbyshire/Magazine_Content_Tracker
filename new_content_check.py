@@ -192,39 +192,56 @@ def save_state(state):
 
 # ---- Filtering new items with Claude ---------------------------------------
 
-def filter_new_fiction(client, magazine_name, new_items):
+def filter_fiction_items(client, magazine_name, items, is_baseline=False):
     """
-    Given candidate 'new' links for a magazine, ask Claude which are genuinely
-    new FICTION stories (including flash/micro fiction) as opposed to poetry,
+    Given candidate links for a magazine, ask Claude which are genuine
+    FICTION stories (including flash/micro fiction) as opposed to poetry,
     art/illustration, nonfiction, editorials, interviews, news posts, or
     navigation/junk links. Returns a list of {title, url, blurb}.
+
+    is_baseline=True is used for a magazine's very first scan, where we're
+    listing what's CURRENTLY live rather than what's NEW since last time —
+    the filtering logic is identical, only the prompt framing changes.
     """
-    if not new_items:
+    if not items:
         return []
 
-    listing = "\n".join(f"- {i['title']} ({i['url']})" for i in new_items)
+    listing = "\n".join(f"- {i['title']} ({i['url']})" for i in items)
 
-    prompt = f"""You are helping identify newly published FICTION content on
-a magazine/podcast website called "{magazine_name}".
+    if is_baseline:
+        context_line = (
+            "This is the FIRST scan of this magazine, so there is no "
+            "'previous scan' to compare against — the links below are "
+            "simply what's currently listed on the site's homepage."
+        )
+    else:
+        context_line = (
+            "The links below appeared on the site's homepage/listing page "
+            "and were NOT present on the previous scan (i.e. they are new "
+            "since last time)."
+        )
 
-Below is a list of links that appeared on the site's homepage/listing page
-and were NOT present on the previous scan (i.e. they are new since last
-time). Some of these may not actually be new stories — they could be
-navigation links, ads, unrelated pages, or non-fiction content.
+    prompt = f"""You are helping identify FICTION content on a magazine/
+podcast website called "{magazine_name}".
 
-ONLY include items that are genuinely new FICTION stories — this includes
-flash fiction and micro fiction / short-shorts. EXCLUDE poetry, art or
+{context_line}
+
+Some of these may not actually be stories — they could be navigation links,
+ads, unrelated pages, or non-fiction content.
+
+ONLY include items that are genuinely FICTION stories — this includes flash
+fiction and micro fiction / short-shorts. EXCLUDE poetry, art or
 illustration features, nonfiction essays, interviews, editorials/news posts,
 "about" or navigation pages, and anything that isn't an actual story.
 
-Candidate new links:
+Candidate links:
 {listing}
 
 Respond with ONLY a JSON array (no other text, no markdown fences) in this
 exact format:
 [{{"title": "story title", "url": "story url", "blurb": "one-sentence description of what the story is about, based on the title/context"}}]
 
-If none of the candidates are genuine new fiction stories, respond with: []
+If none of the candidates are genuine fiction stories, respond with: []
 Do not invent details beyond what's implied by the title/link text.
 """
 
@@ -254,81 +271,100 @@ Do not invent details beyond what's implied by the title/link text.
 
 # ---- Email ------------------------------------------------------------------
 
-def build_digest_html(results_by_magazine, baseline_magazines):
+def build_digest_html(results_by_magazine, baseline_results_by_magazine):
     today = date.today().strftime("%B %d, %Y")
 
     def esc(s):
         return html_module.escape(s or "")
 
-    magazines_with_new = sorted(
-        (name for name, items in results_by_magazine.items() if items),
-        key=lambda n: n.lower(),
-    )
+    def render_section(heading, results_dict, note=None):
+        names = sorted(
+            (name for name, items in results_dict.items() if items),
+            key=lambda n: n.lower(),
+        )
+        if not names:
+            return ""
+        parts = [f"<h2>{esc(heading)}</h2>"]
+        if note:
+            parts.append(f"<p style='color:#666; font-size:12px;'>{esc(note)}</p>")
+        for name in names:
+            items = results_dict[name]
+            entries = "".join(
+                f"<p style='margin:0 0 12px 20px;'>"
+                f"{esc(item.get('title', 'Untitled'))} — {esc(item.get('blurb', ''))}<br>"
+                f"<a href='{esc(item.get('url', ''))}'>{esc(item.get('url', ''))}</a>"
+                f"</p>"
+                for item in items
+            )
+            parts.append(f"<p style='margin:0 0 4px 0;'><b>{esc(name)}</b></p>{entries}")
+        return "".join(parts)
 
     total_new = sum(len(v) for v in results_by_magazine.values())
+    new_magazine_count = len([n for n, v in results_by_magazine.items() if v])
 
-    sections = []
-    for name in magazines_with_new:
-        items = results_by_magazine[name]
-        entries = "".join(
-            f"<p style='margin:0 0 12px 20px;'>"
-            f"{esc(item.get('title', 'Untitled'))} — {esc(item.get('blurb', ''))}<br>"
-            f"<a href='{esc(item.get('url', ''))}'>{esc(item.get('url', ''))}</a>"
-            f"</p>"
-            for item in items
-        )
-        sections.append(
-            f"<p style='margin:0 0 4px 0;'><b>{esc(name)}</b></p>{entries}"
-        )
+    new_section = render_section("New Stories", results_by_magazine)
+    baseline_section = render_section(
+        "Currently Live (First Scan)",
+        baseline_results_by_magazine,
+        note=(
+            "These magazines were scanned for the first time — shown below is what's "
+            "currently live on their sites. Future scans will report only new additions."
+        ),
+    )
 
-    if not sections:
+    if not new_section and not baseline_section:
         body_content = "<p>No new fiction, flash, or micro stories found since the last scan.</p>"
     else:
-        body_content = "".join(sections)
-
-    baseline_note = ""
-    if baseline_magazines:
-        names = ", ".join(sorted(baseline_magazines))
-        baseline_note = (
-            f"<p style='color:#666; font-size:12px;'>Note: first-time scan for: {esc(names)}. "
-            f"These establish a baseline and won't show new content until the next scan.</p>"
-        )
+        body_content = (new_section or "<h2>New Stories</h2><p>None this scan.</p>") + baseline_section
 
     return f"""
     <html>
       <body style="font-family: Arial, sans-serif; font-size: 14px; color: #222;">
-        <h2>New Fiction Content — {today}</h2>
-        <p>{total_new} new stor{"y" if total_new == 1 else "ies"} found across {len(magazines_with_new)} magazine(s).</p>
+        <h1 style="font-size:18px;">Fiction Content Digest — {today}</h1>
+        <p>{total_new} new stor{"y" if total_new == 1 else "ies"} found across {new_magazine_count} magazine(s).</p>
         {body_content}
-        {baseline_note}
       </body>
     </html>
     """
 
 
-def build_digest_text(results_by_magazine, baseline_magazines):
+def build_digest_text(results_by_magazine, baseline_results_by_magazine):
     today = date.today().strftime("%B %d, %Y")
-    lines = [f"New Fiction Content — {today}", ""]
+    lines = [f"Fiction Content Digest — {today}", ""]
 
-    magazines_with_new = sorted(
-        (name for name, items in results_by_magazine.items() if items),
-        key=lambda n: n.lower(),
-    )
-
-    if not magazines_with_new:
-        lines.append("No new fiction, flash, or micro stories found since the last scan.")
-    else:
-        for name in magazines_with_new:
+    def render_section(heading, results_dict, note=None):
+        names = sorted(
+            (name for name, items in results_dict.items() if items),
+            key=lambda n: n.lower(),
+        )
+        if not names:
+            return
+        lines.append(f"=== {heading} ===")
+        if note:
+            lines.append(note)
+        lines.append("")
+        for name in names:
             lines.append(name)
-            for item in results_by_magazine[name]:
+            for item in results_dict[name]:
                 lines.append(f"  {item.get('title', 'Untitled')} — {item.get('blurb', '')}")
                 lines.append(f"    {item.get('url', '')}")
             lines.append("")
 
-    if baseline_magazines:
-        lines.append("")
-        lines.append(f"Note: first-time scan for: {', '.join(sorted(baseline_magazines))}.")
-        lines.append("These establish a baseline and won't show new content until the next scan.")
+    has_new = any(results_by_magazine.values())
+    has_baseline = any(baseline_results_by_magazine.values())
+
+    if not has_new and not has_baseline:
+        lines.append("No new fiction, flash, or micro stories found since the last scan.")
+    else:
+        render_section("New Stories", results_by_magazine)
+        render_section(
+            "Currently Live (First Scan)",
+            baseline_results_by_magazine,
+            note=(
+                "These magazines were scanned for the first time — shown below is what's "
+                "currently live. Future scans will report only new additions."
+            ),
+        )
 
     return "\n".join(lines)
 
@@ -358,7 +394,7 @@ def main():
     state = load_state()
 
     results_by_magazine = {}
-    baseline_magazines = []
+    baseline_results_by_magazine = {}
     new_state = dict(state)  # start from previous state, update as we go
 
     for mag in MAGAZINES:
@@ -376,9 +412,13 @@ def main():
         previously_seen = set(state.get(name, []))
 
         if name not in state:
-            # First time seeing this magazine — establish baseline, don't report.
-            print(f"  first scan — establishing baseline ({len(current_urls)} links)")
-            baseline_magazines.append(name)
+            # First time seeing this magazine — show what's currently live,
+            # labeled as a baseline rather than "new".
+            print(f"  first scan — {len(current_urls)} links, checking with Claude...")
+            fiction_items = filter_fiction_items(client, name, current_items, is_baseline=True)
+            print(f"  -> {len(fiction_items)} current fiction item(s)")
+            if fiction_items:
+                baseline_results_by_magazine[name] = fiction_items
             new_state[name] = list(current_urls)
             continue
 
@@ -387,7 +427,7 @@ def main():
 
         if new_items:
             print(f"  found {len(new_items)} candidate new link(s), checking with Claude...")
-            fiction_items = filter_new_fiction(client, name, new_items)
+            fiction_items = filter_fiction_items(client, name, new_items, is_baseline=False)
             print(f"  -> {len(fiction_items)} confirmed new fiction item(s)")
             if fiction_items:
                 results_by_magazine[name] = fiction_items
@@ -400,14 +440,14 @@ def main():
 
     save_state(new_state)
 
-    digest_text = build_digest_text(results_by_magazine, baseline_magazines)
-    digest_html = build_digest_html(results_by_magazine, baseline_magazines)
+    digest_text = build_digest_text(results_by_magazine, baseline_results_by_magazine)
+    digest_html = build_digest_html(results_by_magazine, baseline_results_by_magazine)
 
     with open("new_content_output.txt", "w", encoding="utf-8") as f:
         f.write(digest_text)
 
     today = date.today().strftime("%B %d, %Y")
-    send_email(f"New Fiction Content — {today}", digest_text, digest_html)
+    send_email(f"Fiction Content Digest — {today}", digest_text, digest_html)
     print("Digest emailed successfully.")
 
 
