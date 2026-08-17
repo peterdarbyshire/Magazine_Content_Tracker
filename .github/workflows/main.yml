@@ -1,0 +1,43 @@
+name: New Fiction Content Check
+
+on:
+  schedule:
+    - cron: '0 13 * * *'   # 13:00 UTC daily — adjust as needed
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed so the workflow can commit the updated state file back
+
+jobs:
+  check-new-content:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install -r requirements.txt
+
+      - run: python -m playwright install --with-deps chromium
+
+      - run: python new_content_check.py
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: new-content-report
+          path: new_content_output.txt
+
+      - name: Commit updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add seen_content.json
+          git commit -m "Update seen content state [skip ci]" || echo "No changes to commit"
+          git push
